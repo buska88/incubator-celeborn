@@ -17,8 +17,6 @@
 
 package org.apache.celeborn.service.deploy.memory
 
-import java.util.concurrent.TimeUnit
-
 import scala.concurrent.duration.DurationInt
 
 import org.mockito.{Mockito, MockitoSugar}
@@ -472,6 +470,209 @@ class MemoryManagerSuite extends CelebornFunSuite {
     override def onTrim(): Unit = {
       // do nothing
     }
+  }
+
+  /**
+   * Records every drainIncompleteFrame invocation (and the ratio it was called with) for assertions.
+   */
+  class RecordingDrainListener extends MemoryPressureListener {
+    val ratios: scala.collection.mutable.ArrayBuffer[Double] =
+      scala.collection.mutable.ArrayBuffer[Double]()
+
+    override def onPause(moduleName: String): Unit = {}
+
+    override def onResume(moduleName: String): Unit = {}
+
+    override def onTrim(): Unit = {}
+
+    override def drainIncompleteFrame(ratio: Double): Int = {
+      ratios += ratio
+      0
+    }
+  }
+
+  test("[Trickle Resume] does not trigger trickle when disabled") {
+    val conf = new CelebornConf()
+    conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "false")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_INTERVAL.key, "0")
+    MemoryManager.reset()
+    val memoryManager = MockitoSugar.spy(MemoryManager.initialize(conf))
+    val pushThreshold =
+      (conf.workerDirectMemoryRatioToPauseReceive * memoryManager.maxDirectMemory).longValue()
+    val listener = new RecordingDrainListener()
+    memoryManager.registerMemoryListener(listener)
+
+    // Memory stuck in Netty (not tracked by app-layer counters) is exactly what draining
+    // targets, but must stay off entirely when disabled.
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
+    memoryManager.switchServingState()
+    assert(memoryManager.servingState == ServingState.PUSH_PAUSED)
+
+    assert(listener.ratios.isEmpty)
+    MemoryManager.reset()
+  }
+
+  test("[Trickle Resume] does not arm until app-layer usage drops to/below the watermark") {
+    val conf = new CelebornConf()
+    conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "true")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_INTERVAL.key, "0")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_WATERMARK_RATIO.key, "0.05")
+    MemoryManager.reset()
+    val memoryManager = MockitoSugar.spy(MemoryManager.initialize(conf))
+    val pushThreshold =
+      (conf.workerDirectMemoryRatioToPauseReceive * memoryManager.maxDirectMemory).longValue()
+    // Above the watermark: draining must not arm.
+    val aboveWatermarkBytes = (0.08 * memoryManager.maxDirectMemory).longValue()
+    val listener = new RecordingDrainListener()
+    memoryManager.registerMemoryListener(listener)
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
+
+    memoryManager.incrementDiskBuffer(aboveWatermarkBytes.intValue())
+    memoryManager.switchServingState()
+    assert(memoryManager.servingState == ServingState.PUSH_PAUSED)
+    assert(listener.ratios.isEmpty)
+
+    // Repeated checks above the watermark still must not probe.
+    memoryManager.switchServingState()
+    assert(listener.ratios.isEmpty)
+    MemoryManager.reset()
+  }
+
+  test("[Trickle Resume] arms at/below watermark, disarms above it, with fixed ratio") {
+    val conf = new CelebornConf()
+    conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "true")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_INTERVAL.key, "0")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_WATERMARK_RATIO.key, "0.05")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_RATIO.key, "0.02")
+    MemoryManager.reset()
+    val memoryManager = MockitoSugar.spy(MemoryManager.initialize(conf))
+    val pushThreshold =
+      (conf.workerDirectMemoryRatioToPauseReceive * memoryManager.maxDirectMemory).longValue()
+    val watermarkBytes = (0.05 * memoryManager.maxDirectMemory).longValue()
+    val listener = new RecordingDrainListener()
+    memoryManager.registerMemoryListener(listener)
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
+
+    // App-layer usage at/below the watermark: draining arms and fires at fixed ratio.
+    memoryManager.switchServingState()
+    assert(memoryManager.servingState == ServingState.PUSH_PAUSED)
+    assert(listener.ratios.nonEmpty)
+    assert(listener.ratios.last == 0.02) // 2%
+
+    // App-layer usage above the watermark: draining disarms.
+    memoryManager.incrementDiskBuffer(watermarkBytes.intValue() + 1)
+    val firedBeforeDisarm = listener.ratios.size
+    memoryManager.switchServingState()
+    assert(listener.ratios.size == firedBeforeDisarm)
+
+    // Drop back to/below the watermark: re-arms and probes again.
+    memoryManager.releaseDiskBuffer(watermarkBytes.intValue() + 1)
+    memoryManager.switchServingState()
+    assert(listener.ratios.size > firedBeforeDisarm)
+    assert(listener.ratios.last == 0.02)
+    MemoryManager.reset()
+  }
+
+  test("[Trickle Resume] pending replicate bytes count towards app-layer usage and block arming") {
+    val conf = new CelebornConf()
+    conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "true")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_INTERVAL.key, "0")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_WATERMARK_RATIO.key, "0.05")
+    MemoryManager.reset()
+    val memoryManager = MockitoSugar.spy(MemoryManager.initialize(conf))
+    val pushThreshold =
+      (conf.workerDirectMemoryRatioToPauseReceive * memoryManager.maxDirectMemory).longValue()
+    val watermarkBytes = (0.05 * memoryManager.maxDirectMemory).longValue()
+    val listener = new RecordingDrainListener
+    memoryManager.registerMemoryListener(listener)
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
+
+    // Sort/disk-buffer/memory-file-storage counters are all zero (pipeline looks drained), but
+    // the replicate client's outbound buffer is still backed up behind an unresponsive peer:
+    // app-layer usage must reflect that and stay above the watermark, so draining never arms.
+    memoryManager.incrementPendingReplicateBytes(watermarkBytes + 1)
+    memoryManager.switchServingState()
+    assert(memoryManager.servingState == ServingState.PUSH_PAUSED)
+    assert(listener.ratios.isEmpty)
+
+    // Once the peer connection drains (outbound buffer empties), app-layer usage drops below the
+    // watermark and draining can arm normally.
+    memoryManager.releasePendingReplicateBytes(watermarkBytes + 1)
+    memoryManager.switchServingState()
+    assert(listener.ratios.nonEmpty)
+    MemoryManager.reset()
+  }
+
+  test("[Trickle Resume] pending replicate bytes above watermark blocks arming; " +
+    "dropping below lets multiple listeners be trickled") {
+    val conf = new CelebornConf()
+    conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "true")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_INTERVAL.key, "0")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_WATERMARK_RATIO.key, "0.05")
+    MemoryManager.reset()
+    val memoryManager = MockitoSugar.spy(MemoryManager.initialize(conf))
+    val pushThreshold =
+      (conf.workerDirectMemoryRatioToPauseReceive * memoryManager.maxDirectMemory).longValue()
+    val watermarkBytes = (0.05 * memoryManager.maxDirectMemory).longValue()
+    val pushListener = new RecordingDrainListener
+    val replicateListener = new RecordingDrainListener
+    memoryManager.registerMemoryListener(pushListener)
+    memoryManager.registerMemoryListener(replicateListener)
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
+
+    // Pending replicate bytes above the watermark: no listener arms.
+    memoryManager.incrementPendingReplicateBytes(watermarkBytes + 1)
+    memoryManager.switchServingState()
+    assert(memoryManager.servingState == ServingState.PUSH_PAUSED)
+    assert(pushListener.ratios.isEmpty)
+    assert(replicateListener.ratios.isEmpty)
+
+    // Once pending bytes drop to/below the watermark, draining arms and fires for every listener.
+    memoryManager.releasePendingReplicateBytes(watermarkBytes + 1)
+    memoryManager.switchServingState()
+    assert(pushListener.ratios.nonEmpty)
+    assert(replicateListener.ratios.nonEmpty)
+    MemoryManager.reset()
+  }
+
+  test("[Trickle Resume] resets tick bookkeeping once backpressure episode ends") {
+    val conf = new CelebornConf()
+    conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "true")
+    conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_INTERVAL.key, "10000")
+    MemoryManager.reset()
+    val memoryManager = MockitoSugar.spy(MemoryManager.initialize(conf))
+    val pushThreshold =
+      (conf.workerDirectMemoryRatioToPauseReceive * memoryManager.maxDirectMemory).longValue()
+    val listener = new RecordingDrainListener()
+    memoryManager.registerMemoryListener(listener)
+
+    // Enter backpressure at the low watermark: arms and drains immediately (first tick is
+    // never throttled).
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
+    memoryManager.switchServingState()
+    assert(listener.ratios.nonEmpty)
+    val firedBeforeResume = listener.ratios.size
+
+    // Checking again immediately is throttled by the (long) drainIncompleteFrame interval.
+    memoryManager.switchServingState()
+    assert(listener.ratios.size == firedBeforeResume)
+
+    // Lift backpressure entirely: resets tick bookkeeping.
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(0L)
+    memoryManager.switchServingState()
+    assert(memoryManager.servingState == ServingState.NONE_PAUSED)
+
+    // A fresh episode re-arms and probes immediately, unthrottled by the old interval.
+    Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
+    memoryManager.switchServingState()
+    assert(listener.ratios.size > firedBeforeResume)
+    MemoryManager.reset()
   }
 
 }

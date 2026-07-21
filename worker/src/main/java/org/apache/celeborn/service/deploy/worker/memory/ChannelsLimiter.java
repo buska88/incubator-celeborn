@@ -17,6 +17,8 @@
 
 package org.apache.celeborn.service.deploy.worker.memory;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -31,6 +33,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.celeborn.common.CelebornConf;
+import org.apache.celeborn.common.network.util.FrameDecoder;
+import org.apache.celeborn.common.network.util.TransportFrameDecoder;
 
 @ChannelHandler.Sharable
 public class ChannelsLimiter extends ChannelDuplexHandler
@@ -126,6 +130,20 @@ public class ChannelsLimiter extends ChannelDuplexHandler
         ((PooledByteBufAllocator) ctx.alloc()).trimCurrentThreadCache();
       }
       needTrimChannels.decrementAndGet();
+    } else if (evt instanceof TransportFrameDecoder.FrameDrainCompleted) {
+      onFrameDrainCompleted(ctx.channel());
+    }
+  }
+
+  /**
+   * Re-pauses the channel after its single drain frame completes, unless a full resume happened
+   * concurrently.
+   */
+  private void onFrameDrainCompleted(Channel channel) {
+    synchronized (isPaused) {
+      if (isPaused.get() && channel.config().isAutoRead()) {
+        channel.config().setAutoRead(false);
+      }
     }
   }
 
@@ -154,6 +172,76 @@ public class ChannelsLimiter extends ChannelDuplexHandler
     if (allowCache) {
       trimCache();
     }
+  }
+
+  /**
+   * Resumes {@code ratio} fraction of paused channels that have a likely-large stuck half-frame
+   * ({@link TransportFrameDecoder#hasLikelyLargeIncompleteFrame()}), each in frame-drain mode.
+   */
+  @Override
+  public int drainIncompleteFrame(double ratio) {
+    List<Channel> candidates = new ArrayList<>();
+    for (Channel ch : channels) {
+      if (!ch.isActive() || ch.config().isAutoRead()) {
+        continue;
+      }
+      TransportFrameDecoder decoder = frameDecoderOf(ch);
+      if (decoder != null && decoder.hasLikelyLargeIncompleteFrame()) {
+        candidates.add(ch);
+      }
+    }
+
+    if (candidates.isEmpty()) {
+      // Only worth logging when backpressure is actually active; if isPaused is false there are
+      // no paused channels to scan, so a zero result is expected and uninteresting.
+      if (isPaused.get()) {
+        logger.info(
+            "{} drainIncompleteFrame skipped this tick: no paused channel found with a stuck "
+                + "half-frame larger than {} bytes.",
+            moduleName,
+            TransportFrameDecoder.MAX_SINGLE_READ_BYTES);
+      }
+      return 0;
+    }
+
+    int targetCount = Math.max(1, (int) (candidates.size() * ratio));
+    int actualResume = Math.min(targetCount, candidates.size());
+
+    int resumed = 0;
+    synchronized (isPaused) {
+      if (!isPaused.get()) {
+        return 0;
+      }
+      for (int i = 0; i < actualResume; i++) {
+        Channel ch = candidates.get(i);
+        // Re-check: state may have changed since the scan above.
+        if (!ch.isActive() || ch.config().isAutoRead()) {
+          continue;
+        }
+        TransportFrameDecoder decoder = frameDecoderOf(ch);
+        if (decoder != null) {
+          decoder.enableFrameDrain();
+        }
+        ch.config().setAutoRead(true);
+        resumed++;
+      }
+    }
+    if (resumed > 0) {
+      logger.info(
+          "{} drainIncompleteFrame resumed {}/{} channels with a stuck half-frame larger than "
+              + "{} bytes (ratio={})",
+          moduleName,
+          resumed,
+          candidates.size(),
+          TransportFrameDecoder.MAX_SINGLE_READ_BYTES,
+          ratio);
+    }
+    return resumed;
+  }
+
+  private static TransportFrameDecoder frameDecoderOf(Channel channel) {
+    Object decoder = channel.pipeline().get(FrameDecoder.HANDLER_NAME);
+    return decoder instanceof TransportFrameDecoder ? (TransportFrameDecoder) decoder : null;
   }
 
   static class TrimCache {}
