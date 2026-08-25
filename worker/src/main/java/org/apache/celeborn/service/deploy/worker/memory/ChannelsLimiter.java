@@ -41,10 +41,14 @@ public class ChannelsLimiter extends ChannelDuplexHandler
     implements MemoryManager.MemoryPressureListener {
 
   private static final Logger logger = LoggerFactory.getLogger(ChannelsLimiter.class);
+  // Throttles the "drainIncompleteFrame resumed" INFO log to at most once per interval, since
+  // sustained backpressure can otherwise emit it on every tick (default every 5ms).
+  private static final long DRAIN_RESUME_LOG_INTERVAL_MS = 10000L;
   private final Set<Channel> channels = ConcurrentHashMap.newKeySet();
   private final String moduleName;
   private final AtomicBoolean isPaused = new AtomicBoolean(false);
   private final AtomicInteger needTrimChannels = new AtomicInteger(0);
+  private volatile long lastDrainResumeLogTime = -1L;
   private final long waitTrimInterval;
   private final boolean allowCache;
 
@@ -192,10 +196,11 @@ public class ChannelsLimiter extends ChannelDuplexHandler
     }
 
     if (candidates.isEmpty()) {
-      // Only worth logging when backpressure is actually active; if isPaused is false there are
-      // no paused channels to scan, so a zero result is expected and uninteresting.
-      if (isPaused.get()) {
-        logger.info(
+      // DEBUG, not INFO: under sustained backpressure with no qualifying candidate, this tick
+      // repeats every drainIncompleteFrame interval (default 5ms) and would otherwise flood logs
+      // (~100/s per paused limiter) right when the incident is already stressing log storage.
+      if (isPaused.get() && logger.isDebugEnabled()) {
+        logger.debug(
             "{} drainIncompleteFrame skipped this tick: no paused channel found with a stuck "
                 + "half-frame larger than {} bytes.",
             moduleName,
@@ -227,14 +232,19 @@ public class ChannelsLimiter extends ChannelDuplexHandler
       }
     }
     if (resumed > 0) {
-      logger.info(
-          "{} drainIncompleteFrame resumed {}/{} channels with a stuck half-frame larger than "
-              + "{} bytes (ratio={})",
-          moduleName,
-          resumed,
-          candidates.size(),
-          TransportFrameDecoder.MAX_SINGLE_READ_BYTES,
-          ratio);
+      long now = System.currentTimeMillis();
+      if (lastDrainResumeLogTime < 0
+          || now - lastDrainResumeLogTime >= DRAIN_RESUME_LOG_INTERVAL_MS) {
+        lastDrainResumeLogTime = now;
+        logger.info(
+            "{} drainIncompleteFrame resumed {}/{} channels with a stuck half-frame larger than "
+                + "{} bytes (ratio={})",
+            moduleName,
+            resumed,
+            candidates.size(),
+            TransportFrameDecoder.MAX_SINGLE_READ_BYTES,
+            ratio);
+      }
     }
     return resumed;
   }
