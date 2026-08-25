@@ -120,18 +120,61 @@ public class TransportFrameDecoderSuiteJ {
   @Test
   public void hasLikelyLargeIncompleteFrameIsFalseWhenLeftoverExactlyEqualsSingleReadCap()
       throws IOException {
-    // The check is a strict ">", not ">=": leftover bytes exactly at the single-channelRead cap
-    // (64KB) are still fully explainable by one read, so this boundary must not be flagged yet.
+    // Strict ">", not ">=": both totalSize and the frame's total length sit exactly at the cap,
+    // so neither check should trip yet.
     int singleReadCapBytes = 65536;
-    byte[] payload = new byte[singleReadCapBytes + 1024];
+    byte[] payload = new byte[singleReadCapBytes - FrameDecoder.HEADER_SIZE - 4];
     ByteBuf full = encodeMessage(oneWayMessage(payload));
-    // Header (9 bytes) + exactly singleReadCapBytes of body, leaving totalSize == 65536.
-    ByteBuf partial = full.retainedSlice(0, FrameDecoder.HEADER_SIZE + singleReadCapBytes);
+    assertEquals(singleReadCapBytes, full.readableBytes());
+    ByteBuf partial = full.retainedSlice(0, full.readableBytes() - 1);
     decoder.channelRead(ctx, partial);
 
     assertFalse(decoder.hasLikelyLargeIncompleteFrame());
     assertTrue(decodedMessages.isEmpty());
     full.release();
+  }
+
+  @Test
+  public void hasLikelyLargeIncompleteFrameIsTrueUsingDecodedFrameLengthEvenWithinSingleReadCap()
+      throws IOException {
+    // A 256KB frame paused right after its first 64KB read: totalSize alone stays under the cap,
+    // but the decoded nextFrameSize correctly flags it as a large incomplete frame.
+    int largeFrameBodyLength = 256 * 1024 - FrameDecoder.HEADER_SIZE - 4;
+    byte[] payload = new byte[largeFrameBodyLength];
+    ByteBuf full = encodeMessage(oneWayMessage(payload));
+    assertEquals(256 * 1024, full.readableBytes());
+
+    ByteBuf partial = full.retainedSlice(0, 65536);
+    decoder.channelRead(ctx, partial);
+
+    assertTrue(decoder.hasLikelyLargeIncompleteFrame());
+    assertTrue(decodedMessages.isEmpty());
+    full.release();
+  }
+
+  @Test
+  public void hasLikelyLargeIncompleteFrameFallsBackToTotalSizeWhenHeaderNotYetFullyRead()
+      throws IOException {
+    // Header not fully read yet, so nextFrameSize is unknown and the check falls back to totalSize.
+    ByteBuf full = encodeMessage(oneWayMessage(new byte[] {1, 2, 3, 4, 5, 6, 7, 8}));
+    ByteBuf partial = full.retainedSlice(0, FrameDecoder.HEADER_SIZE - 2);
+    decoder.channelRead(ctx, partial);
+
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame());
+    full.release();
+  }
+
+  @Test
+  public void hasLikelyLargeIncompleteFrameResetsAfterFrameCompletesAndNextHeaderNotYetRead()
+      throws IOException {
+    // After a large frame is fully decoded, nextFrameSize resets; the predicate must not keep
+    // reporting true based on stale state.
+    int largeFrameBodyLength = 256 * 1024 - FrameDecoder.HEADER_SIZE;
+    ByteBuf full = encodeMessage(oneWayMessage(new byte[largeFrameBodyLength]));
+    decoder.channelRead(ctx, full);
+
+    assertEquals(1, decodedMessages.size());
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame());
   }
 
   @Test

@@ -59,9 +59,10 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter implemen
 
   private final LinkedList<ByteBuf> buffers = new LinkedList<>();
 
-  // Written by the Netty I/O thread; read by checkService via hasLikelyLargeIncompleteFrame().
+  // totalSize and nextFrameSize: written by the Netty I/O thread, read by checkService via
+  // hasLikelyLargeIncompleteFrame().
   private volatile long totalSize = 0;
-  private long nextFrameSize = UNKNOWN_FRAME_SIZE;
+  private volatile long nextFrameSize = UNKNOWN_FRAME_SIZE;
 
   /**
    * When set, this channel is resumed only to drain its stuck half-received frame (in {@link
@@ -75,10 +76,15 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter implemen
   }
 
   /**
-   * True if the stuck frame's buffered bytes exceed one {@code channelRead} worth ({@link
-   * #MAX_SINGLE_READ_BYTES}), making it a strong candidate for the backpressure root cause.
+   * True if the stuck frame is a strong candidate for the backpressure root cause. Uses the
+   * decoded frame length ({@code nextFrameSize}) when known, since a large frame paused right
+   * after its first {@code channelRead} may still have a small {@code totalSize}; falls back to
+   * {@code totalSize} while the header hasn't been fully read yet.
    */
   public boolean hasLikelyLargeIncompleteFrame() {
+    if (nextFrameSize != UNKNOWN_FRAME_SIZE) {
+      return nextFrameSize > MAX_SINGLE_READ_BYTES;
+    }
     return totalSize > MAX_SINGLE_READ_BYTES;
   }
 
