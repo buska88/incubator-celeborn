@@ -35,6 +35,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.celeborn.common.CelebornConf;
 import org.apache.celeborn.common.network.util.FrameDecoder;
 import org.apache.celeborn.common.network.util.TransportFrameDecoder;
+import org.apache.celeborn.common.protocol.TransportModuleConstants;
 
 @ChannelHandler.Sharable
 public class ChannelsLimiter extends ChannelDuplexHandler
@@ -179,18 +180,23 @@ public class ChannelsLimiter extends ChannelDuplexHandler
   }
 
   /**
-   * Resumes {@code ratio} fraction of paused channels that have a likely-large stuck half-frame
-   * ({@link TransportFrameDecoder#hasLikelyLargeIncompleteFrame()}), each in frame-drain mode.
+   * Resumes {@code ratio} fraction of paused channels that have a likely-large stuck half-frame,
+   * each in frame-drain mode. No-op if {@code moduleName} does not match this limiter's module.
    */
   @Override
-  public int drainIncompleteFrame(double ratio) {
+  public int drainIncompleteFrame(double ratio, String moduleName) {
+    if (!this.moduleName.equals(moduleName)) {
+      return 0;
+    }
     List<Channel> candidates = new ArrayList<>();
     for (Channel ch : channels) {
       if (!ch.isActive() || ch.config().isAutoRead()) {
         continue;
       }
       TransportFrameDecoder decoder = frameDecoderOf(ch);
-      if (decoder != null && decoder.hasLikelyLargeIncompleteFrame()) {
+      if (decoder != null
+          && decoder.hasLikelyLargeIncompleteFrame(
+              TransportModuleConstants.REPLICATE_MODULE.equals(moduleName))) {
         candidates.add(ch);
       }
     }

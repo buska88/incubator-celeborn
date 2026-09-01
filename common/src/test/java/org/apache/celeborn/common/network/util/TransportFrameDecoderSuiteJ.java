@@ -84,7 +84,8 @@ public class TransportFrameDecoderSuiteJ {
 
   @Test
   public void hasLikelyLargeIncompleteFrameIsFalseInitially() {
-    assertFalse(decoder.hasLikelyLargeIncompleteFrame());
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(false));
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(true));
   }
 
   @Test
@@ -95,16 +96,17 @@ public class TransportFrameDecoderSuiteJ {
     ByteBuf partial = full.retainedSlice(0, FrameDecoder.HEADER_SIZE + 2);
     decoder.channelRead(ctx, partial);
 
-    assertFalse(decoder.hasLikelyLargeIncompleteFrame());
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(false));
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(true));
     full.release();
   }
 
   @Test
   public void hasLikelyLargeIncompleteFrameIsTrueOnceLeftoverExceedsSingleReadCap()
       throws IOException {
-    // A single channelRead cannot deliver more than 64KB (Netty's AdaptiveRecvByteBufAllocator
-    // default maximum), so leftover bytes beyond that can only have piled up over multiple reads
-    // that each failed to complete the frame — i.e. a genuinely large frame stuck mid-transfer.
+    // A single channelRead cannot deliver more than 64KB, so leftover bytes beyond that can only
+    // have piled up over multiple reads — i.e. a genuinely large frame stuck mid-transfer. Here
+    // the whole leftover belongs to a single frame, so both checks agree.
     int oversizedBodyLength = 65536 + 1024;
     byte[] payload = new byte[oversizedBodyLength];
     ByteBuf full = encodeMessage(oneWayMessage(payload));
@@ -112,7 +114,8 @@ public class TransportFrameDecoderSuiteJ {
     ByteBuf partial = full.retainedSlice(0, full.readableBytes() - 1);
     decoder.channelRead(ctx, partial);
 
-    assertTrue(decoder.hasLikelyLargeIncompleteFrame());
+    assertTrue(decoder.hasLikelyLargeIncompleteFrame(false));
+    assertTrue(decoder.hasLikelyLargeIncompleteFrame(true));
     assertTrue(decodedMessages.isEmpty());
     full.release();
   }
@@ -129,16 +132,18 @@ public class TransportFrameDecoderSuiteJ {
     ByteBuf partial = full.retainedSlice(0, full.readableBytes() - 1);
     decoder.channelRead(ctx, partial);
 
-    assertFalse(decoder.hasLikelyLargeIncompleteFrame());
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(false));
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(true));
     assertTrue(decodedMessages.isEmpty());
     full.release();
   }
 
   @Test
-  public void hasLikelyLargeIncompleteFrameIsTrueUsingDecodedFrameLengthEvenWithinSingleReadCap()
-      throws IOException {
-    // A 256KB frame paused right after its first 64KB read: totalSize alone stays under the cap,
-    // but the decoded nextFrameSize correctly flags it as a large incomplete frame.
+  public void
+      hasLikelyLargeIncompleteFrameSizeIsTrueUsingDecodedFrameLengthEvenWithinSingleReadCap()
+          throws IOException {
+    // A 256KB frame paused right after its first 64KB read: totalSize (leftover body bytes only)
+    // stays under the cap, but the decoded frame length correctly flags it as large.
     int largeFrameBodyLength = 256 * 1024 - FrameDecoder.HEADER_SIZE - 4;
     byte[] payload = new byte[largeFrameBodyLength];
     ByteBuf full = encodeMessage(oneWayMessage(payload));
@@ -147,20 +152,22 @@ public class TransportFrameDecoderSuiteJ {
     ByteBuf partial = full.retainedSlice(0, 65536);
     decoder.channelRead(ctx, partial);
 
-    assertTrue(decoder.hasLikelyLargeIncompleteFrame());
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(false));
+    assertTrue(decoder.hasLikelyLargeIncompleteFrame(true));
     assertTrue(decodedMessages.isEmpty());
     full.release();
   }
 
   @Test
-  public void hasLikelyLargeIncompleteFrameFallsBackToTotalSizeWhenHeaderNotYetFullyRead()
+  public void hasLikelyLargeIncompleteFrameSizeFallsBackToTotalSizeWhenHeaderNotYetFullyRead()
       throws IOException {
     // Header not fully read yet, so nextFrameSize is unknown and the check falls back to totalSize.
     ByteBuf full = encodeMessage(oneWayMessage(new byte[] {1, 2, 3, 4, 5, 6, 7, 8}));
     ByteBuf partial = full.retainedSlice(0, FrameDecoder.HEADER_SIZE - 2);
     decoder.channelRead(ctx, partial);
 
-    assertFalse(decoder.hasLikelyLargeIncompleteFrame());
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(false));
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(true));
     full.release();
   }
 
@@ -174,7 +181,8 @@ public class TransportFrameDecoderSuiteJ {
     decoder.channelRead(ctx, full);
 
     assertEquals(1, decodedMessages.size());
-    assertFalse(decoder.hasLikelyLargeIncompleteFrame());
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(false));
+    assertFalse(decoder.hasLikelyLargeIncompleteFrame(true));
   }
 
   @Test

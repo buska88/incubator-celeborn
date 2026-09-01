@@ -61,12 +61,25 @@ public class ChannelsLimiterSuiteJ {
     return addPausedChannel(hasIncompleteFrame, false);
   }
 
+  private FakeChannel addPausedChannel(
+      boolean hasIncompleteFrame, boolean hasLikelyLargeIncompleteFrame) throws Exception {
+    return addPausedChannel(
+        hasIncompleteFrame, hasLikelyLargeIncompleteFrame, hasLikelyLargeIncompleteFrame);
+  }
+
   /**
    * Creates a channel whose autoRead state is backed by a real boolean, and adds it to the limiter.
    */
   private FakeChannel addPausedChannel(
-      boolean hasIncompleteFrame, boolean hasLikelyLargeIncompleteFrame) throws Exception {
-    FakeChannel channel = new FakeChannel(hasIncompleteFrame, hasLikelyLargeIncompleteFrame);
+      boolean hasIncompleteFrame,
+      boolean hasLikelyLargeIncompleteTotalSize,
+      boolean hasLikelyLargeIncompleteFrameSize)
+      throws Exception {
+    FakeChannel channel =
+        new FakeChannel(
+            hasIncompleteFrame,
+            hasLikelyLargeIncompleteTotalSize,
+            hasLikelyLargeIncompleteFrameSize);
     limiter.handlerAdded(channel.ctx);
     // pause it explicitly regardless of the global state, simulating a channel that was
     // paused while backpressure was active.
@@ -76,7 +89,7 @@ public class ChannelsLimiterSuiteJ {
 
   @Test
   public void drainIncompleteFrameReturnsZeroWhenNoChannelsArePaused() {
-    assertEquals(0, limiter.drainIncompleteFrame(1.0));
+    assertEquals(0, limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE));
   }
 
   @Test
@@ -86,7 +99,15 @@ public class ChannelsLimiterSuiteJ {
     addPausedChannel(true);
     addPausedChannel(false);
 
-    assertEquals(0, limiter.drainIncompleteFrame(1.0));
+    assertEquals(0, limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE));
+  }
+
+  @Test
+  public void drainIncompleteFrameReturnsZeroWhenModuleNameDoesNotMatch() throws Exception {
+    limiter.onPause(TransportModuleConstants.PUSH_MODULE);
+    addPausedChannel(true, true);
+
+    assertEquals(0, limiter.drainIncompleteFrame(1.0, TransportModuleConstants.REPLICATE_MODULE));
   }
 
   @Test
@@ -98,7 +119,7 @@ public class ChannelsLimiterSuiteJ {
     FakeChannel withSmallHalfFrame = addPausedChannel(true, false);
     FakeChannel withoutHalfFrame = addPausedChannel(false, false);
 
-    int resumed = limiter.drainIncompleteFrame(1.0);
+    int resumed = limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE);
 
     assertEquals(1, resumed);
     assertTrue(withLargeHalfFrame.isAutoRead());
@@ -116,7 +137,7 @@ public class ChannelsLimiterSuiteJ {
     FakeChannel withSmallHalfFrame = addPausedChannel(true, false);
     FakeChannel withoutHalfFrame = addPausedChannel(false, false);
 
-    int resumed = limiter.drainIncompleteFrame(1.0);
+    int resumed = limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE);
 
     assertEquals(0, resumed);
     assertFalse(withSmallHalfFrame.isAutoRead());
@@ -137,7 +158,7 @@ public class ChannelsLimiterSuiteJ {
       channels.add(addPausedChannel(true, true));
     }
 
-    int firstBatch = limiter.drainIncompleteFrame(0.3);
+    int firstBatch = limiter.drainIncompleteFrame(0.3, TransportModuleConstants.PUSH_MODULE);
     assertEquals(3, firstBatch);
     long resumedAfterFirst = channels.stream().filter(FakeChannel::isAutoRead).count();
     assertEquals(3, resumedAfterFirst);
@@ -152,14 +173,14 @@ public class ChannelsLimiterSuiteJ {
     }
 
     // Second tick: 0.3 * 7 = 2.1 → max(1,2) = 2 resumed from the remaining 7.
-    int secondBatch = limiter.drainIncompleteFrame(0.3);
+    int secondBatch = limiter.drainIncompleteFrame(0.3, TransportModuleConstants.PUSH_MODULE);
     assertEquals(2, secondBatch);
     long resumedAfterSecond = channels.stream().filter(FakeChannel::isAutoRead).count();
     assertEquals(2, resumedAfterSecond);
     // The remaining 5 channels (7 - 2 resumed this tick) still report a large incomplete frame.
     long stillInLargeTier =
         channels.stream()
-            .filter(ch -> !ch.isAutoRead() && ch.decoder.hasLikelyLargeIncompleteFrame())
+            .filter(ch -> !ch.isAutoRead() && ch.decoder.hasLikelyLargeIncompleteFrame(false))
             .count();
     assertEquals(5, stillInLargeTier);
   }
@@ -173,7 +194,7 @@ public class ChannelsLimiterSuiteJ {
       channels.add(addPausedChannel(true, true));
     }
 
-    int resumed = limiter.drainIncompleteFrame(0.3);
+    int resumed = limiter.drainIncompleteFrame(0.3, TransportModuleConstants.PUSH_MODULE);
 
     assertEquals(3, resumed);
     long actuallyResumed = channels.stream().filter(FakeChannel::isAutoRead).count();
@@ -190,7 +211,7 @@ public class ChannelsLimiterSuiteJ {
     alreadyReading.setAutoRead(true);
     FakeChannel eligible = addPausedChannel(true, true);
 
-    int resumed = limiter.drainIncompleteFrame(1.0);
+    int resumed = limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE);
 
     assertEquals(1, resumed);
     assertTrue(eligible.isAutoRead());
@@ -201,7 +222,7 @@ public class ChannelsLimiterSuiteJ {
   public void onFrameDrainCompletedReClosesChannelWhenStillGloballyPaused() throws Exception {
     limiter.onPause(TransportModuleConstants.PUSH_MODULE);
     FakeChannel channel = addPausedChannel(true, true);
-    limiter.drainIncompleteFrame(1.0);
+    limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE);
     assertTrue(channel.isAutoRead());
 
     limiter.userEventTriggered(channel.ctx, TransportFrameDecoder.FrameDrainCompleted.INSTANCE);
@@ -214,7 +235,7 @@ public class ChannelsLimiterSuiteJ {
       throws Exception {
     limiter.onPause(TransportModuleConstants.PUSH_MODULE);
     FakeChannel channel = addPausedChannel(true, true);
-    limiter.drainIncompleteFrame(1.0);
+    limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE);
     assertTrue(channel.isAutoRead());
 
     // Backpressure is lifted globally while the frame-drain read was in flight.
@@ -238,6 +259,39 @@ public class ChannelsLimiterSuiteJ {
     assertFalse(channel.isAutoRead());
   }
 
+  @Test
+  public void pushModuleRanksCandidatesByTotalSizeNotFrameSize() throws Exception {
+    limiter.onPause(TransportModuleConstants.PUSH_MODULE);
+    FakeChannel largeTotalSizeOnly = addPausedChannel(true, true, false);
+
+    int resumed = limiter.drainIncompleteFrame(1.0, TransportModuleConstants.PUSH_MODULE);
+
+    assertEquals(1, resumed);
+    assertTrue(largeTotalSizeOnly.isAutoRead());
+  }
+
+  @Test
+  public void replicateModuleRanksCandidatesByFrameSizeNotTotalSize() throws Exception {
+    ChannelsLimiter replicateLimiter =
+        new ChannelsLimiter(TransportModuleConstants.REPLICATE_MODULE, new CelebornConf());
+    replicateLimiter.onPause(TransportModuleConstants.REPLICATE_MODULE);
+
+    FakeChannel largeFrameSizeOnly = new FakeChannel(true, false, true);
+    replicateLimiter.handlerAdded(largeFrameSizeOnly.ctx);
+    largeFrameSizeOnly.setAutoRead(false);
+
+    FakeChannel largeTotalSizeOnly = new FakeChannel(true, true, false);
+    replicateLimiter.handlerAdded(largeTotalSizeOnly.ctx);
+    largeTotalSizeOnly.setAutoRead(false);
+
+    int resumed =
+        replicateLimiter.drainIncompleteFrame(1.0, TransportModuleConstants.REPLICATE_MODULE);
+
+    assertEquals(1, resumed);
+    assertTrue(largeFrameSizeOnly.isAutoRead());
+    assertFalse(largeTotalSizeOnly.isAutoRead());
+  }
+
   /**
    * A minimal fake {@link Channel} wired up with a real {@link TransportFrameDecoder} in its
    * pipeline, and an autoRead flag backed by a plain boolean so that ChannelsLimiter's read/write
@@ -252,8 +306,15 @@ public class ChannelsLimiterSuiteJ {
     final TestableFrameDecoder decoder;
     boolean active = true;
 
-    FakeChannel(boolean hasIncompleteFrame, boolean hasLikelyLargeIncompleteFrame) {
-      decoder = new TestableFrameDecoder(hasIncompleteFrame, hasLikelyLargeIncompleteFrame);
+    FakeChannel(
+        boolean hasIncompleteFrame,
+        boolean hasLikelyLargeIncompleteTotalSize,
+        boolean hasLikelyLargeIncompleteFrameSize) {
+      decoder =
+          new TestableFrameDecoder(
+              hasIncompleteFrame,
+              hasLikelyLargeIncompleteTotalSize,
+              hasLikelyLargeIncompleteFrameSize);
       when(channel.config()).thenReturn(config);
       when(channel.pipeline()).thenReturn(pipeline);
       when(channel.isActive()).thenAnswer(inv -> active);
@@ -280,22 +341,28 @@ public class ChannelsLimiterSuiteJ {
   /** Exposes frameDrain state for assertions without changing TransportFrameDecoder's API. */
   private static class TestableFrameDecoder extends TransportFrameDecoder {
     private boolean incomplete;
-    private boolean likelyLargeIncomplete;
+    private boolean likelyLargeIncompleteTotalSize;
+    private boolean likelyLargeIncompleteFrameSize;
 
-    TestableFrameDecoder(boolean incomplete, boolean likelyLargeIncomplete) {
+    TestableFrameDecoder(
+        boolean incomplete,
+        boolean likelyLargeIncompleteTotalSize,
+        boolean likelyLargeIncompleteFrameSize) {
       this.incomplete = incomplete;
-      this.likelyLargeIncomplete = likelyLargeIncomplete;
+      this.likelyLargeIncompleteTotalSize = likelyLargeIncompleteTotalSize;
+      this.likelyLargeIncompleteFrameSize = likelyLargeIncompleteFrameSize;
     }
 
     @Override
-    public boolean hasLikelyLargeIncompleteFrame() {
-      return likelyLargeIncomplete;
+    public boolean hasLikelyLargeIncompleteFrame(boolean byFrameSize) {
+      return byFrameSize ? likelyLargeIncompleteFrameSize : likelyLargeIncompleteTotalSize;
     }
 
     /** Simulates the channel's stuck half-frame being fully consumed after being probed. */
     void clearIncompleteFrame() {
       incomplete = false;
-      likelyLargeIncomplete = false;
+      likelyLargeIncompleteTotalSize = false;
+      likelyLargeIncompleteFrameSize = false;
     }
 
     boolean frameDrainEnabled() {

@@ -473,11 +473,13 @@ class MemoryManagerSuite extends CelebornFunSuite {
   }
 
   /**
-   * Records every drainIncompleteFrame invocation (and the ratio it was called with) for assertions.
+   * Records every drainIncompleteFrame invocation (module name and ratio) for assertions.
    */
   class RecordingDrainListener extends MemoryPressureListener {
     val ratios: scala.collection.mutable.ArrayBuffer[Double] =
       scala.collection.mutable.ArrayBuffer[Double]()
+    val moduleNames: scala.collection.mutable.ArrayBuffer[String] =
+      scala.collection.mutable.ArrayBuffer[String]()
 
     override def onPause(moduleName: String): Unit = {}
 
@@ -485,8 +487,9 @@ class MemoryManagerSuite extends CelebornFunSuite {
 
     override def onTrim(): Unit = {}
 
-    override def drainIncompleteFrame(ratio: Double): Int = {
+    override def drainIncompleteFrame(ratio: Double, moduleName: String): Int = {
       ratios += ratio
+      moduleNames += moduleName
       0
     }
   }
@@ -576,7 +579,8 @@ class MemoryManagerSuite extends CelebornFunSuite {
     MemoryManager.reset()
   }
 
-  test("[Trickle Resume] pending replicate bytes count towards app-layer usage and block arming") {
+  test("[Trickle Resume] pending replicate bytes above watermark blocks PUSH_MODULE but not " +
+    "REPLICATE_MODULE, since it doesn't reflect this worker's own memory footprint") {
     val conf = new CelebornConf()
     conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
     conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "true")
@@ -591,24 +595,21 @@ class MemoryManagerSuite extends CelebornFunSuite {
     memoryManager.registerMemoryListener(listener)
     Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
 
-    // Sort/disk-buffer/memory-file-storage counters are all zero (pipeline looks drained), but
-    // the replicate client's outbound buffer is still backed up behind an unresponsive peer:
-    // app-layer usage must reflect that and stay above the watermark, so draining never arms.
+    // Pending replicate bytes above watermark: PUSH_MODULE stays blocked, REPLICATE_MODULE arms.
     memoryManager.incrementPendingReplicateBytes(watermarkBytes + 1)
     memoryManager.switchServingState()
     assert(memoryManager.servingState == ServingState.PUSH_PAUSED)
-    assert(listener.ratios.isEmpty)
+    assert(!listener.moduleNames.contains(TransportModuleConstants.PUSH_MODULE))
+    assert(listener.moduleNames.contains(TransportModuleConstants.REPLICATE_MODULE))
 
-    // Once the peer connection drains (outbound buffer empties), app-layer usage drops below the
-    // watermark and draining can arm normally.
     memoryManager.releasePendingReplicateBytes(watermarkBytes + 1)
     memoryManager.switchServingState()
-    assert(listener.ratios.nonEmpty)
+    assert(listener.moduleNames.contains(TransportModuleConstants.PUSH_MODULE))
     MemoryManager.reset()
   }
 
-  test("[Trickle Resume] pending replicate bytes above watermark blocks arming; " +
-    "dropping below lets multiple listeners be trickled") {
+  test("[Trickle Resume] local footprint above watermark blocks REPLICATE_MODULE regardless of " +
+    "pending replicate bytes") {
     val conf = new CelebornConf()
     conf.set(CelebornConf.WORKER_PINNED_MEMORY_CHECK_ENABLED.key, "false")
     conf.set(CelebornConf.WORKER_DRAIN_INCOMPLETE_FRAME_ENABLED.key, "true")
@@ -619,24 +620,19 @@ class MemoryManagerSuite extends CelebornFunSuite {
     val pushThreshold =
       (conf.workerDirectMemoryRatioToPauseReceive * memoryManager.maxDirectMemory).longValue()
     val watermarkBytes = (0.05 * memoryManager.maxDirectMemory).longValue()
-    val pushListener = new RecordingDrainListener
-    val replicateListener = new RecordingDrainListener
-    memoryManager.registerMemoryListener(pushListener)
-    memoryManager.registerMemoryListener(replicateListener)
+    val listener = new RecordingDrainListener
+    memoryManager.registerMemoryListener(listener)
     Mockito.when(memoryManager.getNettyUsedDirectMemory).thenReturn(pushThreshold + 1)
 
-    // Pending replicate bytes above the watermark: no listener arms.
-    memoryManager.incrementPendingReplicateBytes(watermarkBytes + 1)
+    // Local footprint above watermark blocks REPLICATE_MODULE too.
+    memoryManager.incrementDiskBuffer(watermarkBytes.intValue() + 1)
     memoryManager.switchServingState()
     assert(memoryManager.servingState == ServingState.PUSH_PAUSED)
-    assert(pushListener.ratios.isEmpty)
-    assert(replicateListener.ratios.isEmpty)
+    assert(listener.moduleNames.isEmpty)
 
-    // Once pending bytes drop to/below the watermark, draining arms and fires for every listener.
-    memoryManager.releasePendingReplicateBytes(watermarkBytes + 1)
+    memoryManager.releaseDiskBuffer(watermarkBytes.intValue() + 1)
     memoryManager.switchServingState()
-    assert(pushListener.ratios.nonEmpty)
-    assert(replicateListener.ratios.nonEmpty)
+    assert(listener.moduleNames.contains(TransportModuleConstants.REPLICATE_MODULE))
     MemoryManager.reset()
   }
 

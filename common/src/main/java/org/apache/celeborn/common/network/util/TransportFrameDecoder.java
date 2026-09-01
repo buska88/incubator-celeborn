@@ -53,7 +53,7 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter implemen
 
   /**
    * Netty's {@code AdaptiveRecvByteBufAllocator} caps a single {@code channelRead} at this many
-   * bytes. Used to spot likely-large stuck frames; see {@link #hasLikelyLargeIncompleteFrame()}.
+   * bytes.
    */
   public static final long MAX_SINGLE_READ_BYTES = 65536;
 
@@ -76,13 +76,13 @@ public class TransportFrameDecoder extends ChannelInboundHandlerAdapter implemen
   }
 
   /**
-   * True if the stuck frame is a strong candidate for the backpressure root cause. Uses the
-   * decoded frame length ({@code nextFrameSize}) when known, since a large frame paused right
-   * after its first {@code channelRead} may still have a small {@code totalSize}; falls back to
-   * {@code totalSize} while the header hasn't been fully read yet.
+   * True if the stuck half-frame looks unusually large. When {@code byFrameSize} is true, ranks by
+   * the frame currently being decoded (falling back to {@code totalSize} while the header hasn't
+   * been fully read yet); otherwise ranks by {@code totalSize}, the total unparsed bytes piled up
+   * regardless of frame boundaries.
    */
-  public boolean hasLikelyLargeIncompleteFrame() {
-    if (nextFrameSize != UNKNOWN_FRAME_SIZE) {
+  public boolean hasLikelyLargeIncompleteFrame(boolean byFrameSize) {
+    if (byFrameSize && nextFrameSize != UNKNOWN_FRAME_SIZE) {
       return nextFrameSize > MAX_SINGLE_READ_BYTES;
     }
     return totalSize > MAX_SINGLE_READ_BYTES;

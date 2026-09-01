@@ -444,18 +444,20 @@ public class MemoryManager {
   }
 
   /**
-   * Fires a drainIncompleteFrame tick when backpressure is active and appActiveMemory is at/below
-   * the watermark.
+   * Fires a drainIncompleteFrame tick when backpressure is active and the relevant usage is
+   * at/below the watermark. REPLICATE_MODULE is evaluated without pendingReplicateBytesCounter,
+   * since that counter doesn't represent this worker's own memory footprint; every other module
+   * uses the full accounting.
    */
   private void checkAndTriggerDrainIncompleteFrame() {
     if (!drainIncompleteFrameEnabled) return;
 
-    long appActiveMemory =
-        sortMemoryCounter.get()
-            + diskBufferCounter.get()
-            + memoryFileStorageCounter.sum()
-            + pendingReplicateBytesCounter.get();
-    if (appActiveMemory > drainIncompleteFrameWatermarkBytes) return;
+    long localActiveMemory =
+        sortMemoryCounter.get() + diskBufferCounter.get() + memoryFileStorageCounter.sum();
+    long appActiveMemory = localActiveMemory + pendingReplicateBytesCounter.get();
+    boolean pushReady = appActiveMemory <= drainIncompleteFrameWatermarkBytes;
+    boolean replicateReady = localActiveMemory <= drainIncompleteFrameWatermarkBytes;
+    if (!pushReady && !replicateReady) return;
 
     long now = System.currentTimeMillis();
     if (drainIncompleteFrameLastTickTime >= 0
@@ -464,7 +466,16 @@ public class MemoryManager {
 
     int resumedChannels = 0;
     for (MemoryPressureListener listener : memoryPressureListeners) {
-      resumedChannels += listener.drainIncompleteFrame(drainIncompleteFrameRatio);
+      if (pushReady) {
+        resumedChannels +=
+            listener.drainIncompleteFrame(
+                drainIncompleteFrameRatio, TransportModuleConstants.PUSH_MODULE);
+      }
+      if (replicateReady) {
+        resumedChannels +=
+            listener.drainIncompleteFrame(
+                drainIncompleteFrameRatio, TransportModuleConstants.REPLICATE_MODULE);
+      }
     }
     if (resumedChannels > 0) {
       logger.info(
@@ -744,10 +755,10 @@ public class MemoryManager {
     void onTrim();
 
     /**
-     * Resume a small subset of paused channels to drain their stuck half-frames. Default no-op; see
-     * {@link ChannelsLimiter}.
+     * Resume a small subset of {@code moduleName}'s paused channels to drain their stuck
+     * half-frames. Default no-op; see {@link ChannelsLimiter}.
      */
-    default int drainIncompleteFrame(double ratio) {
+    default int drainIncompleteFrame(double ratio, String moduleName) {
       return 0;
     }
   }
